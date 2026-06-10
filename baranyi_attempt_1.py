@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 
 def run_calibrated_baranyi(filename):
     # --- CALIBRATED PARAMETERS ---
-    # b = 0.0378 (Calibrated to match ComBase Pseudomonas at 3°C)
     b = 0.01903
     T_min = -12.9
     
