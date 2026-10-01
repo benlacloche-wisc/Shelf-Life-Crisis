@@ -1,0 +1,181 @@
+import machine
+import neopixel
+import time
+import math
+#import ds18b20
+import onewire
+
+# -----------------------------------------------------------------------------
+# HARDWARE SETUP
+# -----------------------------------------------------------------------------
+# Onboard NeoPixel LED (GPIO16)
+LED_PIN = 16
+NUM_LEDS = 1
+np = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
+
+# DS18B20 Temperature Probe on GPIO15 (Fallback to internal ADC4 if not attached)
+OW_PIN = 15
+ow = onewire.OneWire(machine.Pin(OW_PIN))
+#ds_sensor = ds18b20.DS18B20(ow)
+#ds_roms = ds_sensor.scan()
+
+adc_chip_temp = machine.ADC(4)  # Backup internal sensor
+
+# -----------------------------------------------------------------------------
+# CALIBRATED BARANYI & RATKOWSKY PARAMETERS
+# -----------------------------------------------------------------------------
+B_RATKOWSKY = 0.01903
+T_MIN = -12.9
+
+Y_0 = math.log(10)          # Initial population (~100 CFU/mL) play with this value to adjust growth
+Y_MAX = math.log(1e9)        # Carrying capacity (~10^9 CFU/mL)
+H_0 = 1.6                    # Physiological debt parameter
+
+WARN_LN = math.log(8.5e4)    # Warning threshold (~8.5x10^4 CFU/mL)
+CRIT_LN = math.log(1e6)      # Spoilage threshold (~1.0x10^6 CFU/mL)
+
+# -----------------------------------------------------------------------------
+# COLOR DEFINITIONS (Hardware GRB order: Green, Red, Blue)
+# -----------------------------------------------------------------------------
+COLOR_GREEN  = (50, 0, 1)    # Green byte first
+COLOR_YELLOW = (40, 50, 0)  # Mix Green & Red
+COLOR_RED    = (0, 50, 0)    # Red byte second
+COLOR_OFF    = (0, 0, 0)
+
+# -----------------------------------------------------------------------------
+# HARDWARE HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
+def set_led(color):
+    """Writes color directly to the onboard NeoPixel."""
+    np[0] = color
+    np.write()
+
+def read_temperature():
+    """Reads external DS18B20 probe; falls back to internal ADC4 if detached."""
+    '''if ds_roms:
+        try:
+            ds_sensor.convert_temp()
+            time.sleep_ms(750)  # Required 12-bit conversion delay
+            return ds_sensor.read_temp(ds_roms[0])
+        except Exception:
+            pass
+'''
+    # Fallback to internal chip sensor if DS18B20 isn't detected
+    raw = adc_chip_temp.read_u16() >> 4
+    voltage = raw * (3.3 / 4095)
+    return (27 - (voltage - 0.706) / 0.001721)-25 #minus 25 to simulate fridge temp. adjust this as necessary
+
+def display_accessible_alert(log_y):
+    """
+    Executes a distinct pattern over an exact 8-second cycle:
+      - SAFE (Green):    1 long pulse (4.0s ON, 4.0s OFF)
+      - WARNING (Yellow): 2 medium pulses (1.5s ON, 1.0s OFF x2 + 3.0s rest)
+      - SPOILED (Red):   4 quick blinks (0.4s ON, 0.4s OFF x4 + 4.8s rest)
+    """
+    if log_y >= CRIT_LN:
+        # SPOILED: 4 Quick Blinks (Total 8.0s)
+        for _ in range(4):
+            set_led(COLOR_RED)
+            time.sleep(0.4)
+            set_led(COLOR_OFF)
+            time.sleep(0.4)
+        time.sleep(4.8)
+
+    elif log_y >= WARN_LN:
+        # WARNING: 2 Medium Pulses (Total 8.0s)
+        for _ in range(2):
+            set_led(COLOR_YELLOW)
+            time.sleep(1.5)
+            set_led(COLOR_OFF)
+            time.sleep(1.0)
+        time.sleep(3.0)
+
+    else:
+        # SAFE: 1 Long Pulse (Total 8.0s)
+        set_led(COLOR_GREEN)
+        time.sleep(4.0)
+        set_led(COLOR_OFF)
+        time.sleep(4.0)
+
+    set_led(COLOR_OFF)
+
+# -----------------------------------------------------------------------------
+# LOGGING HELPER & INITIALIZATION
+# -----------------------------------------------------------------------------
+def reset_and_init_log():
+    """Overwrites log.csv on startup to clear old data and write fresh headers."""
+    try:
+        with open("log.csv", "w") as f:
+            f.write("Time_Hours,Temp_C,Pop_CFU,Status\n")
+        print("Log file successfully reset. Storing fresh session data in log.csv...")
+    except Exception as e:
+        print(f"Failed to reset log file: {e}")
+
+def log_data(time_hours, temp, pop_cfu, status):
+    """Appends running calculation data directly to the active session log."""
+    try:
+        with open("log.csv", "a") as f:
+            f.write(f"{time_hours:.2f},{temp:.2f},{int(pop_cfu)},{status}\n")
+    except Exception as e:
+        print(f"File write error: {e}")
+
+# Call this ONCE during initial startup before the main while loop:
+reset_and_init_log()
+# -----------------------------------------------------------------------------
+# MAIN MODELING EXECUTION
+# -----------------------------------------------------------------------------
+print("Starting System...")
+
+# Initialize persistent log file on board flash
+try:
+    with open("log.csv", "r") as f:
+        pass
+except OSError:
+    with open("log.csv", "w") as f:
+        f.write("Time_Hours,Temp_C,Pop_CFU,Status\n")
+
+# State variables
+y_t = Y_0
+A_state = 1.0 / (math.exp(H_0) - 1.0)
+elapsed_hours = 0.0
+
+# Sampling step length (adjust DT_HOURS to match actual power-cycle interval)
+DT_HOURS = 0.5  # Represents 30-minute steps between cycles
+
+print(f"{'Time (h)':<8} | {'Temp (°C)':<10} | {'Pop (CFU/mL)':<14} | {'Status'}")
+print("-" * 52)
+
+while True:
+    temp = read_temperature()
+    
+    # 1. Update maximum specific growth rate (Ratkowsky)
+    mu_max = (B_RATKOWSKY * (temp - T_MIN)) ** 2 if temp > T_MIN else 0.0
+    
+    # 2. Baranyi adjustment (Sharp J curve logic)
+    alpha_t = A_state / (1.0 + A_state)
+    f_t = 1.0 - math.exp(y_t - Y_MAX)
+    
+    # 3. Differential step integration
+    y_t += (mu_max * alpha_t * f_t * DT_HOURS)
+    
+    # 4. Update physiological adaptation state
+    A_state += (mu_max * A_state * DT_HOURS)
+    
+    pop_actual = math.exp(y_t)
+    
+    # LED status decision
+    if y_t >= CRIT_LN:
+        status = "RED"
+    elif y_t >= WARN_LN:
+        status = "YELLOW"
+    else:
+        status = "GREEN"
+        
+    # Log to board storage and print to shell
+    log_data(elapsed_hours, temp, pop_actual, status)
+    print(f"{elapsed_hours:<8.2f} | {temp:<10.1f} | {int(pop_actual):<14} | {status}")
+    
+    # Show status blink pattern (takes exactly 8 seconds)
+    display_accessible_alert(y_t)
+    
+    elapsed_hours += DT_HOURS
