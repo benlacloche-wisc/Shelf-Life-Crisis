@@ -1,0 +1,197 @@
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <LittleFS.h>
+#include <cmath>
+
+// -----------------------------------------------------------------------------
+// HARDWARE SETUP & PINS
+// -----------------------------------------------------------------------------
+#define LED_PIN       16
+#define NUM_LEDS      1
+#define ONE_WIRE_BUS  15
+
+// Initialize NeoPixel (Adafruit defaults to NEO_GRB + NEO_KHZ800)
+Adafruit_NeoPixel np(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Initialize OneWire & DS18B20
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds_sensor(&oneWire);
+
+// -----------------------------------------------------------------------------
+// CALIBRATED BARANYI & RATKOWSKY PARAMETERS
+// -----------------------------------------------------------------------------
+const float B_RATKOWSKY = 0.0095f;
+const float T_MIN       = -8.0f;
+
+const float Y_0     = std::log(100.0f);   // Initial population (~100 CFU/mL)
+const float Y_MAX   = std::log(1e9f);     // Carrying capacity (~10^9 CFU/mL)
+const float H_0     = 5.5f;               // Physiological debt parameter
+
+const float WARN_LN = std::log(8.5e4f);   // Warning threshold (~8.5x10^4 CFU/mL)
+const float CRIT_LN = std::log(1e6f);     // Spoilage threshold (~1.0x10^6 CFU/mL)
+
+// Model State Variables
+float y_t           = Y_0;
+float A_state       = 1.0f / (std::exp(H_0) - 1.0f);
+float elapsed_hours = 0.0f;
+const float DT_HOURS = 1.5f;              // Sampling time step
+
+// -----------------------------------------------------------------------------
+// HELPER FUNCTIONS
+// -----------------------------------------------------------------------------
+
+// Sets RGB color on onboard NeoPixel
+void set_led(uint8_t r, uint8_t g, uint8_t b) {
+    np.setPixelColor(0, np.Color(r, g, b));
+    np.show();
+}
+
+// Temperature reader: uses DS18B20 with ADC backup simulation offset
+float read_temperature() {
+    ds_sensor.requestTemperatures();
+    float tempC = ds_sensor.getTempCByIndex(0);
+
+    // If DS18B20 is disconnected or encounters an error
+    if (tempC == DEVICE_DISCONNECTED_C) {
+        // Fallback to ESP32 internal ADC read simulation (-25 offset for test)
+        uint16_t raw = analogRead(34); // Adjust ADC pin as needed
+        float voltage = raw * (3.3f / 4095.0f);
+        tempC = (27.0f - (voltage - 0.706f) / 0.001721f) - 25.0f;
+    }
+    return tempC;
+}
+
+// Display accessibility visual blinking patterns (exact 8-second timing)
+void display_accessible_alert(float log_y) {
+    if (log_y >= CRIT_LN) {
+        // SPOILED: Red (0, 50, 0 in GRB equivalent) -> 4 Quick Blinks (8.0s)
+        for (int i = 0; i < 4; i++) {
+            set_led(255, 0, 0);
+            delay(400);
+            set_led(0, 0, 0);
+            delay(400);
+        }
+        delay(4800);
+
+    } else if (log_y >= WARN_LN) {
+        // WARNING: Yellow -> 2 Medium Pulses (8.0s)
+        for (int i = 0; i < 2; i++) {
+            set_led(200, 120, 0);
+            delay(1500);
+            set_led(0, 0, 0);
+            delay(1000);
+        }
+        delay(3000);
+
+    } else {
+        // SAFE: Green -> 1 Long Pulse (8.0s)
+        set_led(0, 150, 0);
+        delay(4000);
+        set_led(0, 0, 0);
+        delay(4000);
+    }
+
+    set_led(0, 0, 0);
+}
+
+// -----------------------------------------------------------------------------
+// FLASH LOGGING (LittleFS)
+// -----------------------------------------------------------------------------
+void reset_and_init_log() {
+    File f = LittleFS.open("/log.csv", "w");
+    if (f) {
+        f.println("Time_Hours,Temp_C,Pop_CFU,Status");
+        f.close();
+        Serial.println("Log file successfully reset. Storing fresh data in /log.csv");
+    } else {
+        Serial.println("Failed to reset log file on LittleFS!");
+    }
+}
+
+void log_data(float time_hours, float temp, float pop_cfu, const char* status) {
+    File f = LittleFS.open("/log.csv", "a");
+    if (f) {
+        f.printf("%.2f,%.2f,%.0f,%s\n", time_hours, temp, pop_cfu, status);
+        f.close();
+    } else {
+        Serial.println("File write error!");
+    }
+}
+
+// Placeholder function for future IoT telemetry expansion
+void send_iot_telemetry(float temp, float pop_cfu, const char* status) {
+    // TODO: Add WiFi / MQTT / HTTP POST logic here
+    // e.g., WiFiClient client; MQTTClient.publish("tti/data", ...);
+}
+
+// -----------------------------------------------------------------------------
+// SETUP
+// -----------------------------------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    // Hardware initializations
+    np.begin();
+    np.clear();
+    np.show();
+    ds_sensor.begin();
+
+    // Mount LittleFS filesystem on flash
+    if (!LittleFS.begin(true)) {
+        Serial.println("LittleFS Mount Failed!");
+        return;
+    }
+
+    reset_and_init_log();
+
+    Serial.println("Starting System...");
+    Serial.printf("%-8s | %-10s | %-14s | %s\n", "Time (h)", "Temp (°C)", "Pop (CFU/mL)", "Status");
+    Serial.println("----------------------------------------------------");
+}
+
+// -----------------------------------------------------------------------------
+// MAIN LOOP
+// -----------------------------------------------------------------------------
+void loop() {
+    float temp = read_temperature();
+
+    // 1. Ratkowsky Growth Rate
+    float mu_max = (temp > T_MIN) ? std::pow(B_RATKOWSKY * (temp - T_MIN), 2) : 0.0f;
+
+    // 2. Baranyi Sharp-J Logic
+    float alpha_t = A_state / (1.0f + A_state);
+    float f_t = 1.0f - std::exp(y_t - Y_MAX);
+
+    // 3. Differential Step Integration
+    y_t += (mu_max * alpha_t * f_t * DT_HOURS);
+
+    // 4. Update Physiological Adaptation State
+    A_state += (mu_max * A_state * DT_HOURS);
+
+    float pop_actual = std::exp(y_t);
+    const char* status;
+
+    // LED Status Logic
+    if (y_t >= CRIT_LN) {
+        status = "RED";
+    } else if (y_t >= WARN_LN) {
+        status = "YELLOW";
+    } else {
+        status = "GREEN";
+    }
+
+    // Output & Log
+    log_data(elapsed_hours, temp, pop_actual, status);
+    Serial.printf("%-8.2f | %-10.1f | %-14.0f | %s\n", elapsed_hours, temp, pop_actual, status);
+
+    // Hook for future IoT messaging
+    send_iot_telemetry(temp, pop_actual, status);
+
+    // Play visual pattern (blocking 8.0 seconds)
+    display_accessible_alert(y_t);
+
+    elapsed_hours += DT_HOURS;
+}
